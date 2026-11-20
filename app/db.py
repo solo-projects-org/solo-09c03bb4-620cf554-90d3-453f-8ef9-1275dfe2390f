@@ -9,6 +9,12 @@ The round's tables are named ``s_gen_<g>`` (samples) and ``r_gen_<g>``
 ``meta_current`` maps round -> current generation; ``meta_generations``
 records provenance; ``meta_refcount`` pins generations while a query is
 running so an upload cannot drop tables a query still reads.
+
+A query always pins *both* rounds through :func:`acquire_snapshot_pair`
+inside one critical section, so the two generations are guaranteed to have
+been simultaneously current.  On every startup the refcount table is reset:
+a process killed mid-query can never release its pins, and stale rows would
+otherwise keep every later-retired generation alive forever.
 """
 from __future__ import annotations
 
@@ -39,6 +45,11 @@ THREADS = int(os.environ.get("DUCKDB_THREADS", "2"))
 
 _writer: duckdb.DuckDBPyConnection | None = None
 _lock = threading.RLock()
+
+# Optional test hook: invoked immediately after a pair snapshot is pinned
+# (the lock has been released, the pins remain). Used to hold a query in a
+# known "snapshot acquired, tables still in use" state. Inert in production.
+snapshot_held_hook = None
 
 
 def init_db() -> None:
@@ -95,14 +106,23 @@ def init_db() -> None:
     ).fetchall()
     for (name,) in rows:
         _writer.execute(f'DROP TABLE IF EXISTS "{name}"')
-    # Any generation without a refcount row starts with zero references.
+    # A process killed mid-query never ran its releases: reset every pin so
+    # references left by the previous process cannot block reclamation.
+    _writer.execute("DELETE FROM meta_refcount")
+    # Every known generation starts with zero references after the reset.
     _writer.execute(
-        """
-        INSERT INTO meta_refcount (generation, refs)
-        SELECT generation, 0 FROM meta_generations g
-        WHERE NOT EXISTS (SELECT 1 FROM meta_refcount r WHERE r.generation = g.generation)
-        """
+        "INSERT INTO meta_refcount (generation, refs) "
+        "SELECT generation, 0 FROM meta_generations"
     )
+    # Reclaim generations already retired before the restart. The two rounds'
+    # current generations stay published and queryable; only non-current
+    # generations (kept alive solely by the dead process's pins) are dropped.
+    retired = _writer.execute(
+        "SELECT generation FROM meta_generations g "
+        "WHERE NOT EXISTS (SELECT 1 FROM meta_current c WHERE c.generation = g.generation)"
+    ).fetchall()
+    for (generation,) in retired:
+        _drop_generation(generation)
 
 
 def _check() -> duckdb.DuckDBPyConnection:
@@ -172,12 +192,60 @@ def acquire_snapshot(round_no: int) -> int | None:
         return gen
 
 
+def acquire_snapshot_pair() -> tuple[int | None, int | None]:
+    """Atomically pin the two rounds' current generations for one query.
+
+    Both reads and both refcount bumps happen in a single critical section,
+    so the returned pair was simultaneously current at query start: a swap
+    of either round during the query cannot mix generations that never
+    coexisted. A ``None`` slot means that round has no published data yet.
+    """
+    with _lock:
+        con = _check()
+        pair = (
+            current_generation(1),
+            current_generation(2),
+        )
+        for gen in pair:
+            if gen is None:
+                continue
+            con.execute(
+                "INSERT INTO meta_refcount VALUES (?, 1) "
+                "ON CONFLICT (generation) DO UPDATE SET refs = meta_refcount.refs + 1",
+                [gen],
+            )
+    if snapshot_held_hook is not None:
+        snapshot_held_hook()
+    return pair
+
+
 def release_snapshot(generation: int) -> None:
     with _lock:
+        row = _check().execute(
+            "SELECT refs FROM meta_refcount WHERE generation = ?", [generation]
+        ).fetchone()
+        if row is None:
+            # Startup reclamation may already have removed a dead row.
+            return
+        refs = max(0, int(row[0]) - 1)
         _check().execute(
-            "UPDATE meta_refcount SET refs = refs - 1 WHERE generation = ?",
-            [generation],
+            "UPDATE meta_refcount SET refs = ? WHERE generation = ?",
+            [refs, generation],
         )
+
+
+def release_snapshot_pair(generations: tuple[int | None, int | None]) -> None:
+    """Release a pair of pins and drop any generation that becomes orphaned.
+
+    A generation is only reclaimed when it carries no references and is no
+    longer a round's current generation; the current data is never dropped.
+    """
+    with _lock:
+        for generation in generations:
+            if generation is None:
+                continue
+            release_snapshot(generation)
+            drop_if_unreferenced(generation)
 
 
 def commit_generation(

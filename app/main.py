@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,6 +13,23 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from . import analysis, db, ingest
 
 UPLOAD_ROOT = Path(os.environ.get("UPLOAD_TMP_DIR", str(db.TMP_DIR)))
+
+# Test hooks are compiled in but inert unless explicitly enabled, so a normal
+# deployment (the Docker image) exposes no query-holding control surface.
+TEST_HOOKS_ENABLED = os.environ.get("ENABLE_TEST_HOOKS", "") == "1"
+
+# Test-only query hold: when enabled, a query blocks just after pinning its
+# snapshot pair (via db.snapshot_held_hook) until the holder is released.
+# Production deployments never touch these endpoints, so the hook stays inert.
+_hold_enabled = threading.Event()
+_hold_entered = threading.Event()
+_hold_release = threading.Event()
+
+
+def _maybe_hold_query() -> None:
+    if _hold_enabled.is_set():
+        _hold_entered.set()
+        _hold_release.wait(300)
 
 
 @asynccontextmanager
@@ -89,6 +107,42 @@ def districts() -> dict:
     return {"districts": analysis.list_districts()}
 
 
+@app.get("/api/debug/generations")
+def debug_generations() -> dict:
+    """Catalog view for lifecycle/ops checks: generations, pins and tables."""
+    with db.writer_lock():
+        con = db._check()
+        generations = [
+            {
+                "generation": int(g),
+                "round": int(r),
+                "current": bool(cur),
+                "refs": int(refs),
+            }
+            for g, r, cur, refs in con.execute(
+                """
+                SELECT g.generation, g.round,
+                       EXISTS (SELECT 1 FROM meta_current c
+                               WHERE c.generation = g.generation),
+                       COALESCE(r.refs, 0)
+                FROM meta_generations g
+                LEFT JOIN meta_refcount r ON r.generation = g.generation
+                ORDER BY g.generation
+                """
+            ).fetchall()
+        ]
+        tables = [
+            row[0]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name LIKE 's\\_gen\\_%' ESCAPE '\\' "
+                "   OR table_name LIKE 'r\\_gen\\_%' ESCAPE '\\' "
+                "ORDER BY table_name"
+            ).fetchall()
+        ]
+    return {"generations": generations, "tables": tables}
+
+
 # GET with a query parameter is the natural fit for the browser UI.
 @app.get("/api/result")
 def result(district: str) -> dict:
@@ -99,3 +153,34 @@ def result(district: str) -> dict:
         return analysis.compute(district)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# ----------------------------------------------------- test-only query hold
+def _require_test_hooks() -> None:
+    if not TEST_HOOKS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@app.post("/api/test/hold/enable")
+def hold_enable() -> dict:
+    _require_test_hooks()
+    _hold_release.clear()
+    _hold_entered.clear()
+    _hold_enabled.set()
+    db.snapshot_held_hook = _maybe_hold_query
+    return {"ok": True}
+
+
+@app.get("/api/test/hold/entered")
+def hold_entered() -> dict:
+    _require_test_hooks()
+    return {"entered": _hold_entered.is_set()}
+
+
+@app.post("/api/test/hold/release")
+def hold_release() -> dict:
+    _require_test_hooks()
+    _hold_enabled.clear()
+    _hold_release.set()
+    db.snapshot_held_hook = None
+    return {"ok": True}

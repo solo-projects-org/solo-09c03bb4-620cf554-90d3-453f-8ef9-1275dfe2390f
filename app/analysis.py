@@ -35,22 +35,27 @@ class RoundResult:
 
 def list_districts() -> list[str]:
     """Districts present in either round's currently published samples."""
-    con = db.read_connection()
+    # Pin the same consistent pair a result query would use, so a concurrent
+    # swap cannot drop a table underneath the listing.
+    gen1, gen2 = db.acquire_snapshot_pair()
     try:
-        # Tables are generation-specific; union whatever is currently live.
-        parts = []
-        for round_no in (1, 2):
-            gen = db.current_generation(round_no)
-            if gen is not None:
-                parts.append(f"SELECT district FROM \"{db.samples_table(gen)}\"")
-        if not parts:
-            return []
-        return [
-            r[0]
-            for r in con.execute(" UNION ".join(parts) + " ORDER BY 1").fetchall()
-        ]
+        con = db.read_connection()
+        try:
+            # Tables are generation-specific; union whatever is currently live.
+            parts = []
+            for gen in (gen1, gen2):
+                if gen is not None:
+                    parts.append(f"SELECT district FROM \"{db.samples_table(gen)}\"")
+            if not parts:
+                return []
+            return [
+                r[0]
+                for r in con.execute(" UNION ".join(parts) + " ORDER BY 1").fetchall()
+            ]
+        finally:
+            con.close()
     finally:
-        con.close()
+        db.release_snapshot_pair((gen1, gen2))
 
 
 def _main_proportion(con, gen: int, district: str) -> RoundResult:
@@ -100,9 +105,9 @@ def compute(district: str) -> dict:
     if not district or not district.strip():
         raise ValueError("district must be a non-empty string")
 
-    # Snapshot the two generations used by this query.
-    gen1 = db.acquire_snapshot(1)
-    gen2 = db.acquire_snapshot(2)
+    # Snapshot both generations in one critical section: this pair was
+    # simultaneously current at query start and stays pinned until the end.
+    gen1, gen2 = db.acquire_snapshot_pair()
     try:
         missing_rounds = [r for r, g in ((1, gen1), (2, gen2)) if g is None]
         if missing_rounds:
@@ -220,12 +225,7 @@ def compute(district: str) -> dict:
             "n_replicates": len(ids1),
         }
     finally:
-        if gen1 is not None:
-            db.release_snapshot(gen1)
-            db.drop_if_unreferenced(gen1)
-        if gen2 is not None:
-            db.release_snapshot(gen2)
-            db.drop_if_unreferenced(gen2)
+        db.release_snapshot_pair((gen1, gen2))
 
 
 def _round_payload(res: RoundResult) -> dict:
